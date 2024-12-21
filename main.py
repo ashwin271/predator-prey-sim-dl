@@ -1,5 +1,9 @@
 import pygame as pg
 import random
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
 
 # Initialize Pygame
 pg.init()
@@ -16,15 +20,17 @@ GRID_ROWS = 15  # Number of rows
 PLAYER_RADIUS = 20  # Radius of the player
 PLAYER_COLOR = "red"
 PREY_COLOR = "green"
-GRID_COLOR = "gray"
+GRID_COLOR = (50, 50, 50)  # Darker gray for grid
+GRID_LINE_WIDTH = 1  # Thinner grid lines
 BOUNDARY_COLOR = "white"
-BG_COLOR = "purple"
+BG_COLOR = (20, 20, 20)  # Dark background
 SPEED = 300  # Player speed (in pixels per second)
 dt = 0.1  # Time delta for movement updates
-MOVE_DELAY = 15  # Controls how often the prey moves (in frames)
+MOVE_DELAY = 10  # Controls how often the prey moves (in frames)
 frame_count = 0  # To track frames for prey movement
 score = 0  # Initialize score
-timer = 60  # Game time in seconds
+elapsed_time = 0  # Initialize elapsed time
+FPS = 20
 
 # Calculate grid boundaries
 grid_width = GRID_COLS * GRID_SIZE
@@ -51,6 +57,40 @@ while True:
     if prey_pos != player_pos:  # Avoid overlap
         break
 
+# Add Neural Network class
+class PredatorNet(nn.Module):
+    def __init__(self):
+        super(PredatorNet, self).__init__()
+        self.network = nn.Sequential(
+            nn.Linear(4, 64),  # Input: relative x, y, distance, angle
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 4)   # Output: up, down, left, right
+        )
+    
+    def forward(self, x):
+        return self.network(x)
+
+# Add these after the pygame initialization
+predator_net = PredatorNet()
+optimizer = optim.Adam(predator_net.parameters(), lr=0.001)
+memory = []  # For experience replay
+GAMMA = 0.99  # Discount factor
+EPSILON = 0.3  # For exploration
+
+# Replace the player movement code with this
+def get_state():
+    # Calculate relative position and other features
+    rel_x = (prey_pos.x - player_pos.x) / grid_width
+    rel_y = (prey_pos.y - player_pos.y) / grid_height
+    distance = player_pos.distance_to(prey_pos) / np.sqrt(grid_width**2 + grid_height**2)
+    angle = np.arctan2(prey_pos.y - player_pos.y, prey_pos.x - player_pos.x) / np.pi
+    return torch.FloatTensor([rel_x, rel_y, distance, angle])
+
+# Use a better font
+font = pg.font.Font('freesansbold.ttf', 32)  # Slightly smaller font
+
 # Main Loop
 while running:
     # Event handling
@@ -58,7 +98,7 @@ while running:
         if event.type == pg.QUIT:
             running = False
 
-    # Clear the screen
+    # Clear screen with background color
     screen.fill(BG_COLOR)
 
     # Draw grid
@@ -66,13 +106,15 @@ while running:
         pg.draw.line(
             screen, GRID_COLOR,
             (boundary_rect.left + x * GRID_SIZE, boundary_rect.top),
-            (boundary_rect.left + x * GRID_SIZE, boundary_rect.bottom)
+            (boundary_rect.left + x * GRID_SIZE, boundary_rect.bottom),
+            GRID_LINE_WIDTH
         )
     for y in range(GRID_ROWS + 1):
         pg.draw.line(
             screen, GRID_COLOR,
             (boundary_rect.left, boundary_rect.top + y * GRID_SIZE),
-            (boundary_rect.right, boundary_rect.top + y * GRID_SIZE)
+            (boundary_rect.right, boundary_rect.top + y * GRID_SIZE),
+            GRID_LINE_WIDTH
         )
 
     # Draw boundary
@@ -108,32 +150,42 @@ while running:
         new_pos = random.choice(possible_moves)
         prey_pos.x, prey_pos.y = new_pos
 
-    # Draw prey
+    # Draw prey with a border
+    pg.draw.circle(screen, "black", prey_pos, GRID_SIZE // 2 + 2)  # Border
     pg.draw.circle(screen, PREY_COLOR, prey_pos, GRID_SIZE // 2)
 
-    # Handle player movement
-    keys = pg.key.get_pressed()
+    # Neural network movement
+    state = get_state()
+    
+    # Epsilon-greedy action selection
+    if random.random() < EPSILON:
+        action = random.randint(0, 3)  # Random action
+    else:
+        with torch.no_grad():
+            q_values = predator_net(state)
+            action = torch.argmax(q_values).item()
+    
+    # Convert action to movement
     new_pos = pg.Vector2(player_pos)
-    if keys[pg.K_w]:
+    if action == 0:  # up
         new_pos.y -= GRID_SIZE
-    if keys[pg.K_s]:
+    elif action == 1:  # down
         new_pos.y += GRID_SIZE
-    if keys[pg.K_a]:
+    elif action == 2:  # left
         new_pos.x -= GRID_SIZE
-    if keys[pg.K_d]:
+    elif action == 3:  # right
         new_pos.x += GRID_SIZE
-
-    # Check boundaries
-    if boundary_rect.collidepoint(new_pos.x, new_pos.y):
-        player_pos = new_pos
-
-    # Draw player
-    pg.draw.circle(screen, PLAYER_COLOR, player_pos, PLAYER_RADIUS)
-
-    # Check if player caught prey
+    
+    # Calculate reward
+    old_distance = player_pos.distance_to(prey_pos)
+    new_distance = new_pos.distance_to(prey_pos)
+    reward = (old_distance - new_distance) / GRID_SIZE  # Positive if getting closer
+    
     if player_pos == prey_pos:
-        score += 1
-        # Spawn new prey at random position (centered in grid cell)
+        reward = 10.0  # Big reward for catching prey
+        score += 1  # Increment score when prey is caught
+        
+        # Reset prey position
         while True:
             prey_pos = pg.Vector2(
                 boundary_rect.left + GRID_SIZE * random.randint(0, GRID_COLS - 1) + GRID_SIZE // 2,
@@ -141,20 +193,59 @@ while running:
             )
             if prey_pos != player_pos:  # Avoid overlap
                 break
+    
+    # Store experience
+    if boundary_rect.collidepoint(new_pos.x, new_pos.y):
+        next_state = get_state()
+        memory.append((state, action, reward, next_state))
+        player_pos = new_pos
+    else:
+        reward = -1.0  # Penalty for hitting boundary
+        next_state = state
+        memory.append((state, action, reward, next_state))
 
-    # Display score
-    font = pg.font.Font(None, 36)
+    # Training step (after collecting enough experience)
+    if len(memory) >= 32:  # Batch size
+        batch = random.sample(memory, 32)
+        states, actions, rewards, next_states = zip(*batch)
+        
+        states = torch.stack(states)
+        next_states = torch.stack(next_states)
+        actions = torch.LongTensor(actions)
+        rewards = torch.FloatTensor(rewards)
+        
+        # Compute Q values
+        current_q_values = predator_net(states).gather(1, actions.unsqueeze(1))
+        next_q_values = predator_net(next_states).max(1)[0].detach()
+        target_q_values = rewards + GAMMA * next_q_values
+        
+        # Compute loss and update network
+        loss = nn.MSELoss()(current_q_values.squeeze(), target_q_values)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    # Draw player with a border
+    pg.draw.circle(screen, "black", player_pos, PLAYER_RADIUS + 2)  # Border
+    pg.draw.circle(screen, PLAYER_COLOR, player_pos, PLAYER_RADIUS)
+
+    # Create UI panel background
+    ui_panel = pg.Surface((200, 120))
+    ui_panel.fill((40, 40, 40))
+    screen.blit(ui_panel, (10, 10))
+
+    # Display score with improved styling
     score_text = font.render(f"Score: {score}", True, "white")
     screen.blit(score_text, (20, 20))
 
+    # Display elapsed time with improved styling
+    elapsed_time += dt
+    time_text = font.render(f"Time: {int(elapsed_time)}s", True, "white")
+    screen.blit(time_text, (20, 70))
+
     # Update display
     pg.display.flip()
-    clock.tick(20 + score)
-
-    # Decrease timer
-    timer -= dt
-    if timer <= 0:
-        running = False
+    clock.tick(FPS)
 
 # Quit Pygame
 pg.quit()
