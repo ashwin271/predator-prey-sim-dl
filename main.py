@@ -9,23 +9,22 @@ import torch.optim as optim
 import sys
 import multiprocessing as mp
 from queue import Empty
+from torch.cuda.amp import autocast, GradScaler
+from torch.utils.tensorboard import SummaryWriter
 
 # Ensure that the 'spawn' start method is used for compatibility (especially on Windows)
 mp.set_start_method('spawn', force=True)
-
-# Initialize device
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Neural Network Class
 class PredatorNet(nn.Module):
     def __init__(self):
         super(PredatorNet, self).__init__()
         self.network = nn.Sequential(
-            nn.Linear(4, 64),  # Input: relative x, y, distance, angle
+            nn.Linear(4, 32),  # Reduced from 64 to 32
             nn.ReLU(),
-            nn.Linear(64, 32),
+            nn.Linear(32, 16),  # Reduced from 32 to 16
             nn.ReLU(),
-            nn.Linear(32, 4)   # Output: up, down, left, right
+            nn.Linear(16, 4)     # Output layer remains the same
         )
     
     def forward(self, x):
@@ -42,17 +41,25 @@ def get_random_prey_pos(boundary_rect, player_pos):
             return pos
 
 # Training Loop Function to run in a separate process
-def training_loop(experience_queue, model_queue, device, MEMORY_SIZE, TRAINING_BATCH_SIZE, GAMMA):
+def training_loop(worker_id, experience_queue, model_queue, device, MEMORY_SIZE, TRAINING_BATCH_SIZE, GAMMA, log_dir):
+    # Initialize TensorBoard writer
+    writer = SummaryWriter(log_dir=log_dir)
+    
     # Initialize training model
     training_model = PredatorNet().to(device)
     training_optimizer = optim.Adam(training_model.parameters(), lr=0.001)
+    scaler = GradScaler()  # For AMP
     local_memory = []
-    
+    training_steps = 0
+
+    print(f"Training process {worker_id} started.")
+
     while True:
         try:
             # Collect experiences from the queue
             experiences = experience_queue.get(timeout=1)  # Wait for experiences
             if experiences == 'END':
+                print(f"Training process {worker_id} received termination signal.")
                 break  # Exit signal
             local_memory.extend(experiences)
             
@@ -63,28 +70,34 @@ def training_loop(experience_queue, model_queue, device, MEMORY_SIZE, TRAINING_B
             # Perform batch training if enough samples
             while len(local_memory) >= TRAINING_BATCH_SIZE:
                 batch = random.sample(local_memory, TRAINING_BATCH_SIZE)
-                states, actions, rewards, next_states = zip(*batch)
-                
-                # Convert to tensors
-                states = torch.stack(states).to(device)
-                next_states = torch.stack(next_states).to(device)
-                actions = torch.LongTensor(actions).to(device)
-                rewards = torch.FloatTensor(rewards).to(device)
+                states = torch.FloatTensor([exp[0] for exp in batch]).to(device)
+                next_states = torch.FloatTensor([exp[3] for exp in batch]).to(device)
+                actions = torch.LongTensor([exp[1] for exp in batch]).to(device)
+                rewards = torch.FloatTensor([exp[2] for exp in batch]).to(device)
                 
                 # Compute Q values
-                current_q_values = training_model(states).gather(1, actions.unsqueeze(1)).squeeze()
-                next_q_values = training_model(next_states).max(1)[0].detach()
-                target_q_values = rewards + GAMMA * next_q_values
+                with autocast():
+                    current_q_values = training_model(states).gather(1, actions.unsqueeze(1)).squeeze()
+                    next_q_values = training_model(next_states).max(1)[0].detach()
+                    target_q_values = rewards + GAMMA * next_q_values
+                    loss = nn.MSELoss()(current_q_values, target_q_values)
                 
-                # Compute loss and update network
-                loss_fn = nn.MSELoss()
-                loss = loss_fn(current_q_values, target_q_values)
+                # Optimize the model
                 training_optimizer.zero_grad()
-                loss.backward()
-                training_optimizer.step()
+                scaler.scale(loss).backward()
+                scaler.unscale_(training_optimizer)
+                torch.nn.utils.clip_grad_norm_(training_model.parameters(), max_norm=1.0)
+                scaler.step(training_optimizer)
+                scaler.update()
+                
+                # Increment training steps
+                training_steps += 1
+                
+                # Log loss to TensorBoard
+                writer.add_scalar('Loss/train', loss.item(), training_steps)
                 
                 # Send updated model to display process
-                model_queue.put((training_model.state_dict(), loss.item()))
+                model_queue.put((training_model.state_dict(), loss.item(), training_steps))
                 
                 # Remove sampled experiences
                 local_memory = local_memory[TRAINING_BATCH_SIZE:]
@@ -92,10 +105,18 @@ def training_loop(experience_queue, model_queue, device, MEMORY_SIZE, TRAINING_B
         except Empty:
             continue
         except Exception as e:
-            print(f"Training process error: {e}")
+            print(f"Training process {worker_id} encountered an error: {e}")
+            model_queue.put((None, None, None))  # Optional: send a signal to main process
             break
 
+    writer.close()
+    print(f"Training process {worker_id} terminated.")
+
 if __name__ == "__main__":
+    # Initialize device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
     # Initialize Pygame
     pg.init()
     
@@ -156,7 +177,7 @@ if __name__ == "__main__":
         rel_y = (prey_pos.y - player_pos.y) / grid_height
         distance = player_pos.distance_to(prey_pos) / np.sqrt(grid_width**2 + grid_height**2)
         angle = np.arctan2(prey_pos.y - player_pos.y, prey_pos.x - player_pos.x) / np.pi
-        return torch.FloatTensor([rel_x, rel_y, distance, angle]).to(device)
+        return [rel_x, rel_y, distance, angle]
     
     # Fonts
     font_large = pg.font.Font('freesansbold.ttf', 28)
@@ -272,7 +293,7 @@ if __name__ == "__main__":
     right_panel = pg.Rect(LEFT_PANEL_WIDTH + MAIN_AREA_WIDTH, 0, RIGHT_PANEL_WIDTH, SCREEN_HEIGHT)
     
     # Add UI elements for user control
-    def draw_left_panel(loss, avg_reward):
+    def draw_left_panel(loss, avg_reward, training_steps, sync_event):
         # Create a semi-transparent left panel
         panel_surface = pg.Surface((LEFT_PANEL_WIDTH, SCREEN_HEIGHT), pg.SRCALPHA)
         panel_surface.fill((50, 50, 50, 220))  # Dark gray with some transparency
@@ -300,7 +321,16 @@ if __name__ == "__main__":
         
         reward_surf = font_medium.render(f"Avg Reward: {avg_reward:.2f}", True, "white")
         screen.blit(reward_surf, (20, 480))
-    
+        
+        # Display Training Steps
+        steps_surf = font_medium.render(f"Training Steps: {training_steps}", True, "white")
+        screen.blit(steps_surf, (20, 510))
+        
+        # Display Sync Notification
+        if sync_event:
+            sync_surf = font_medium.render("Model Synced!", True, "yellow")
+            screen.blit(sync_surf, (20, 540))
+
     def draw_right_panel(current_action):
         # Create semi-transparent right panel
         panel_surface = pg.Surface((RIGHT_PANEL_WIDTH, SCREEN_HEIGHT), pg.SRCALPHA)
@@ -353,29 +383,29 @@ if __name__ == "__main__":
                 
             label_rect = label_surf.get_rect(center=label_pos)
             screen.blit(label_surf, label_rect)
-    
+
     # Initialize neural network components
     predator_net = PredatorNet().to(device)
-    # Initially, we won't set up optimizer or memory in main process
-    # Training is handled in a separate process
-    # Optimizer and memory variables are removed from main
+    predator_net.eval()  # Set to evaluation mode for inference
     
     # Initialize multiprocessing queues
     experience_queue = mp.Queue()
     model_queue = mp.Queue()
     
     # Training constants
-    PARALLEL_ENVIRONMENTS = 8  # Number of parallel training environments
-    TRAINING_BATCH_SIZE = 512  # Larger batch size for parallel training
-    SYNC_INTERVAL = 30  # How often to sync the display model with training model (in frames)
+    NUM_TRAINING_WORKERS = 1  # Use a single training process for a single GPU
+    TRAINING_BATCH_SIZE = 512  # Try larger batch size if GPU memory permits
+    SYNC_INTERVAL = 10  # How often to sync the display model with training model (in frames)
     MEMORY_SIZE = 10000  # Increased memory size
     BATCH_SIZE = 64  # Original batch size for experience collection
     GAMMA = 0.99  # Discount factor
     
-    # Start training process
+    # Start the single training process
     training_process = mp.Process(target=training_loop, args=(
-        experience_queue, model_queue, device, MEMORY_SIZE, TRAINING_BATCH_SIZE, GAMMA))
+        0, experience_queue, model_queue, device, MEMORY_SIZE, TRAINING_BATCH_SIZE, GAMMA, "runs/training_worker_0"))
     training_process.start()
+    training_processes = [training_process]
+    print("Started 1 training process.")
     
     # Initialize local experience buffer
     local_experiences = []
@@ -385,6 +415,8 @@ if __name__ == "__main__":
     loss = None
     avg_reward = 0.0
     reward_history = []
+    training_steps = 0
+    sync_event = False
     
     # Main Loop
     while running:
@@ -399,10 +431,10 @@ if __name__ == "__main__":
         # Update SPEED and EPSILON from sliders
         SPEED = sliders['speed'].value
         EPSILON = sliders['epsilon'].value
-    
+
         # Clear screen with background color
         screen.fill(BG_COLOR)
-    
+
         # Draw Grid in the Main Area
         for x in range(GRID_COLS + 1):
             pg.draw.line(
@@ -418,10 +450,10 @@ if __name__ == "__main__":
                 (boundary_rect.right, boundary_rect.top + y * GRID_SIZE),
                 GRID_LINE_WIDTH
             )
-    
+
         # Draw Boundary
         pg.draw.rect(screen, BOUNDARY_COLOR, boundary_rect, 2)
-    
+
         # Move Prey randomly every MOVE_DELAY frames
         frame_count += 1
         if frame_count >= MOVE_DELAY:
@@ -451,20 +483,21 @@ if __name__ == "__main__":
             # Choose and apply random move
             new_pos = pg.Vector2(random.choice(possible_moves))
             prey_pos.x, prey_pos.y = new_pos
-    
+
         # Draw Prey with a border
         pg.draw.circle(screen, "black", (int(prey_pos.x), int(prey_pos.y)), GRID_SIZE // 2 + 3)  # Border
         pg.draw.circle(screen, PREY_COLOR, (int(prey_pos.x), int(prey_pos.y)), GRID_SIZE // 2)
-    
+
         # Neural network movement
         state = get_state()
         
-        # Epsilon-greedy action selection (unchanged)
+        # Epsilon-greedy action selection
         if random.random() < EPSILON:
             action = random.randint(0, 3)  # Random action
         else:
             with torch.no_grad():
-                q_values = predator_net(state)
+                state_tensor = torch.FloatTensor(state).to(device)
+                q_values = predator_net(state_tensor)
                 action = torch.argmax(q_values).item()
         
         # Convert action to movement
@@ -497,8 +530,8 @@ if __name__ == "__main__":
             
             next_state = get_state()
         
-        # Store experience locally
-        local_experiences.append((state.cpu(), action, reward, next_state.cpu()))
+        # Store experience locally as lists
+        local_experiences.append((state, action, reward, next_state))
         
         # Send experiences to training process periodically
         if len(local_experiences) >= BATCH_SIZE:
@@ -510,37 +543,48 @@ if __name__ == "__main__":
         if len(reward_history) > 100:
             reward_history.pop(0)
         avg_reward = sum(reward_history) / len(reward_history) if reward_history else 0.0
-    
-        # Update display model periodically
+
+        # Synchronize model with trained models periodically
         frame_since_sync += 1
         if frame_since_sync >= SYNC_INTERVAL:
             frame_since_sync = 0
-            # Retrieve the latest model state if available
+            # Retrieve training updates if available
             while not model_queue.empty():
                 try:
-                    new_state_dict, new_loss = model_queue.get_nowait()
-                    predator_net.load_state_dict(new_state_dict)
-                    loss = new_loss
+                    new_state_dict, new_loss, steps = model_queue.get_nowait()
+                    if new_state_dict is not None:
+                        predator_net.load_state_dict(new_state_dict)
+                        loss = new_loss
+                        training_steps = steps
+                        sync_event = True  # Trigger sync notification
+                        print(f"Model synced at training step {training_steps} with loss {loss:.4f}")
                 except Empty:
                     break
-    
+
         # Draw Player with a border
         pg.draw.circle(screen, "black", (int(player_pos.x), int(player_pos.y)), PLAYER_RADIUS + 3)  # Border
         pg.draw.circle(screen, PLAYER_COLOR, (int(player_pos.x), int(player_pos.y)), PLAYER_RADIUS)
-    
+
         # Draw UI Panels
-        draw_left_panel(loss, avg_reward)
+        draw_left_panel(loss, avg_reward, training_steps, sync_event)
         draw_right_panel(action)
-    
+
+        # Display sync notification briefly
+        if sync_event:
+            pg.display.flip()
+            pg.time.delay(500)  # Display for half a second
+            sync_event = False
+
         # Update elapsed time
         elapsed_time += 1 / FPS
-    
+
         # Update display
         pg.display.flip()
         clock.tick(FPS)
-    
+
     # Cleanup
     experience_queue.put('END')  # Signal the training process to terminate
     training_process.join()
+    print("Training process terminated.")
     pg.quit()
     sys.exit()
