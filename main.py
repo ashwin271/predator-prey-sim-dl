@@ -23,6 +23,8 @@ SPEED = 300  # Player speed (in pixels per second)
 dt = 0.1  # Time delta for movement updates
 MOVE_DELAY = 15  # Controls how often the prey moves (in frames)
 frame_count = 0  # To track frames for prey movement
+score = 0  # Initialize score
+timer = 60  # Game time in seconds
 
 # Calculate grid boundaries
 grid_width = GRID_COLS * GRID_SIZE
@@ -41,10 +43,13 @@ player_pos = pg.Vector2(
 )
 
 # Initialize prey at a random grid position (corrected)
-prey_pos = pg.Vector2(
-    boundary_rect.left + GRID_SIZE * random.randint(0, GRID_COLS - 1) + GRID_SIZE // 2,
-    boundary_rect.top + GRID_SIZE * random.randint(0, GRID_ROWS - 1) + GRID_SIZE // 2
-)
+while True:
+    prey_pos = pg.Vector2(
+        boundary_rect.left + GRID_SIZE * random.randint(0, GRID_COLS - 1) + GRID_SIZE // 2,
+        boundary_rect.top + GRID_SIZE * random.randint(0, GRID_ROWS - 1) + GRID_SIZE // 2
+    )
+    if prey_pos != player_pos:  # Avoid overlap
+        break
 
 # Main Loop
 while running:
@@ -92,6 +97,13 @@ while running:
         # Add current position to possible moves (prey might not move)
         possible_moves.append((prey_pos.x, prey_pos.y))
         
+        # Enhance prey movement to move away from player if close
+        if player_pos.distance_to(prey_pos) <= GRID_SIZE * 3:  # Within 3 cells
+            possible_moves = sorted(
+                possible_moves,
+                key=lambda move: -pg.Vector2(move).distance_to(player_pos)
+            )
+        
         # Choose and apply random move
         new_pos = random.choice(possible_moves)
         prey_pos.x, prey_pos.y = new_pos
@@ -120,15 +132,29 @@ while running:
 
     # Check if player caught prey
     if player_pos == prey_pos:
+        score += 1
         # Spawn new prey at random position (centered in grid cell)
-        prey_pos = pg.Vector2(
-            boundary_rect.left + GRID_SIZE * random.randint(0, GRID_COLS - 1) + GRID_SIZE // 2,
-            boundary_rect.top + GRID_SIZE * random.randint(0, GRID_ROWS - 1) + GRID_SIZE // 2
-        )
+        while True:
+            prey_pos = pg.Vector2(
+                boundary_rect.left + GRID_SIZE * random.randint(0, GRID_COLS - 1) + GRID_SIZE // 2,
+                boundary_rect.top + GRID_SIZE * random.randint(0, GRID_ROWS - 1) + GRID_SIZE // 2
+            )
+            if prey_pos != player_pos:  # Avoid overlap
+                break
+
+    # Display score
+    font = pg.font.Font(None, 36)
+    score_text = font.render(f"Score: {score}", True, "white")
+    screen.blit(score_text, (20, 20))
 
     # Update display
     pg.display.flip()
-    clock.tick(20)
+    clock.tick(20 + score)
+
+    # Decrease timer
+    timer -= dt
+    if timer <= 0:
+        running = False
 
 # Quit Pygame
 pg.quit()
